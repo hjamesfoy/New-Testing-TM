@@ -3,6 +3,8 @@ import os
 import asyncio
 from dataclasses import dataclass
 from typing import List
+from datetime import datetime
+import uuid
 
 from dotenv import load_dotenv
 import logfire
@@ -143,6 +145,7 @@ async def get_page_content(ctx: RunContext[PydanticAIDeps], url: str) -> str:
 # ---------------------------
 app = FastAPI()
 
+# The original simple endpoint (if you wish to keep it)
 class ChatRequest(BaseModel):
     query: str
 
@@ -161,10 +164,84 @@ async def chat_endpoint(request: ChatRequest):
     )
     ctx = RunContext(deps=deps)
     try:
-        response = await pydantic_ai_expert.run(request.query, ctx)
-        return ChatResponse(answer=response)
+        response_text = await pydantic_ai_expert.run(request.query, ctx)
+        return ChatResponse(answer=response_text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------
+# New Endpoint for /v1/chat/completions
+# ---------------------------
+
+# Define models that mimic the OpenAI Chat Completions API format.
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "gpt-4o-mini"
+    messages: List[ChatMessage]
+
+class ChatChoice(BaseModel):
+    index: int
+    message: ChatMessage
+    finish_reason: str
+
+class ChatUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[ChatChoice]
+    usage: ChatUsage
+
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def chat_completions_endpoint(request: ChatCompletionRequest):
+    # Extract the last user message from the provided messages.
+    user_messages = [msg for msg in request.messages if msg.role == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="No user message found.")
+    query = user_messages[-1].content
+
+    # Build the dependencies context and run the agent.
+    deps = PydanticAIDeps(
+        supabase=supabase_client,
+        openai_client=openai_client
+    )
+    ctx = RunContext(deps=deps)
+    try:
+        response_text = await pydantic_ai_expert.run(query, ctx)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Prepare the response in the Chat Completions format.
+    assistant_message = ChatMessage(role="assistant", content=response_text)
+    now = int(datetime.utcnow().timestamp())
+    # (For this example, token usage is mocked.)
+    usage = ChatUsage(
+        prompt_tokens=0,
+        completion_tokens=len(response_text.split()),
+        total_tokens=len(response_text.split())
+    )
+    response = ChatCompletionResponse(
+        id=str(uuid.uuid4()),
+        created=now,
+        model=request.model,
+        choices=[
+            ChatChoice(
+                index=0,
+                message=assistant_message,
+                finish_reason="stop"
+            )
+        ],
+        usage=usage
+    )
+    return response
 
 # Only used when running locally. Render will use the command specified in its settings.
 if __name__ == "__main__":
